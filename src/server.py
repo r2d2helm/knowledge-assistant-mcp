@@ -2,12 +2,14 @@
 Knowledge Assistant MCP Server
 
 Provides tools to search, explore, and query the Obsidian Knowledge vault.
+Features in-memory caching for fast repeated queries.
 """
 
 import asyncio
 import json
 import os
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -25,10 +27,114 @@ from mcp.types import (
 # Configuration
 VAULT_PATH = Path(os.environ.get("KNOWLEDGE_VAULT_PATH", r"C:\Users\r2d2\Documents\Knowledge"))
 INDEX_PATH = Path(os.environ.get("KNOWLEDGE_INDEX_PATH", r"C:\Users\r2d2\.claude\skills\knowledge-watcher-skill\data\notes-index.json"))
+CACHE_TTL = int(os.environ.get("KNOWLEDGE_CACHE_TTL", "60"))  # seconds
 
 # Initialize server
 server = Server("knowledge-assistant")
 
+
+# ============== In-Memory Cache ==============
+
+class VaultCache:
+    """In-memory cache for vault notes. Avoids repeated filesystem scans."""
+
+    def __init__(self, vault_path: Path, ttl: int = 60):
+        self.vault_path = vault_path
+        self.ttl = ttl
+        self._notes: list[dict] = []  # [{path, rel_path, stem, content, content_lower, frontmatter, body, links, tags, mtime}]
+        self._loaded_at: float = 0
+        self._note_stems: set[str] = set()  # For quick basename lookup
+
+    @property
+    def is_stale(self) -> bool:
+        return (time.time() - self._loaded_at) > self.ttl
+
+    def refresh(self, force: bool = False) -> None:
+        """Reload all notes from disk if cache is stale."""
+        if not force and not self.is_stale:
+            return
+
+        notes = []
+        stems = set()
+
+        for note_file in self.vault_path.rglob("*.md"):
+            rel_path = note_file.relative_to(self.vault_path)
+            # Skip hidden folders
+            if any(part.startswith(".") for part in rel_path.parts):
+                continue
+
+            try:
+                content = note_file.read_text(encoding="utf-8")
+                frontmatter, body = parse_frontmatter(content)
+                stem = note_file.stem
+                content_lower = content.lower()
+
+                links = re.findall(r'\[\[([^\]|]+)(?:\|[^\]]+)?\]\]', content)
+
+                notes.append({
+                    "path": note_file,
+                    "rel_path": rel_path,
+                    "rel_path_str": str(rel_path),
+                    "stem": stem,
+                    "stem_lower": stem.lower(),
+                    "content": content,
+                    "content_lower": content_lower,
+                    "frontmatter": frontmatter,
+                    "body": body,
+                    "body_lower": body.lower(),
+                    "links": list(set(links)),
+                    "tags": frontmatter.get("tags", []),
+                    "type": frontmatter.get("type", "unknown"),
+                    "date": frontmatter.get("date", ""),
+                    "mtime": note_file.stat().st_mtime,
+                    "word_count": len(body.split()),
+                    "is_template": any(part.startswith("_Template") for part in rel_path.parts),
+                })
+                stems.add(stem)
+            except Exception:
+                continue
+
+        self._notes = notes
+        self._note_stems = stems
+        self._loaded_at = time.time()
+
+    def get_notes(self, include_templates: bool = False) -> list[dict]:
+        """Get all cached notes."""
+        self.refresh()
+        if include_templates:
+            return self._notes
+        return [n for n in self._notes if not n["is_template"]]
+
+    def get_note_by_path(self, note_path: str) -> dict | None:
+        """Find a note by relative path or title match."""
+        self.refresh()
+        # Exact path match
+        for note in self._notes:
+            if note["rel_path_str"] == note_path:
+                return note
+        # Title/stem match
+        path_lower = note_path.lower()
+        for note in self._notes:
+            if path_lower in note["stem_lower"]:
+                return note
+        return None
+
+    @property
+    def note_count(self) -> int:
+        self.refresh()
+        return len(self._notes)
+
+    @property
+    def note_stems(self) -> set[str]:
+        self.refresh()
+        return self._note_stems
+
+
+# Global cache instance
+vault_cache = VaultCache(VAULT_PATH, CACHE_TTL)
+
+
+# ============== Helper Functions ==============
 
 def load_index() -> dict:
     """Load the notes index."""
@@ -54,173 +160,125 @@ def parse_frontmatter(content: str) -> tuple[dict, str]:
     return frontmatter, body
 
 
+# ============== Search & Query Functions (cached) ==============
+
 def search_notes(query: str, max_results: int = 10) -> list[dict]:
-    """Search notes by content or title.
+    """Search notes by content or title using cached data.
 
     Supports multi-word queries: all words must be present (AND logic).
-    Words can be in any order and location in the document.
     """
     results = []
 
-    # Split query into individual terms, filter empty strings
     terms = [t.strip().lower() for t in re.split(r'[\s\-_]+', query) if t.strip()]
     if not terms:
         return []
 
-    for note_file in VAULT_PATH.rglob("*.md"):
-        # Skip templates and hidden folders
-        rel_path = note_file.relative_to(VAULT_PATH)
-        if any(part.startswith("_Template") or part.startswith(".") for part in rel_path.parts):
-            continue
-
+    for note in vault_cache.get_notes():
         try:
-            content = note_file.read_text(encoding="utf-8")
-            content_lower = content.lower()
-            title = note_file.stem
-            title_lower = title.lower()
-
             # Check if ALL terms are present (AND logic)
             all_terms_found = all(
-                term in title_lower or term in content_lower
+                term in note["stem_lower"] or term in note["content_lower"]
                 for term in terms
             )
 
             if not all_terms_found:
                 continue
 
-            # Calculate score based on term occurrences
+            # Calculate score
             score = 0
-            best_term_idx = -1
-
             for term in terms:
-                # Title matches worth more
-                if term in title_lower:
+                if term in note["stem_lower"]:
                     score += 10
+                score += note["content_lower"].count(term)
 
-                # Count occurrences in content
-                term_count = content_lower.count(term)
-                score += term_count
-
-                # Track position of first term for snippet
-                idx = content_lower.find(term)
-                if idx >= 0 and (best_term_idx < 0 or idx < best_term_idx):
-                    best_term_idx = idx
-
-            frontmatter, body = parse_frontmatter(content)
-            body_lower = body.lower()
-
-            # Extract snippet around first found term
+            # Extract snippet
             snippet_idx = -1
             for term in terms:
-                idx = body_lower.find(term)
+                idx = note["body_lower"].find(term)
                 if idx >= 0:
                     snippet_idx = idx
                     break
 
             if snippet_idx >= 0:
                 start = max(0, snippet_idx - 50)
-                end = min(len(body), snippet_idx + 150)
-                snippet = "..." + body[start:end].replace("\n", " ") + "..."
+                end = min(len(note["body"]), snippet_idx + 150)
+                snippet = "..." + note["body"][start:end].replace("\n", " ") + "..."
             else:
-                snippet = body[:200].replace("\n", " ") + "..."
+                snippet = note["body"][:200].replace("\n", " ") + "..."
 
             results.append({
-                "title": title,
-                "path": str(rel_path),
+                "title": note["stem"],
+                "path": note["rel_path_str"],
                 "score": score,
                 "snippet": snippet,
-                "tags": frontmatter.get("tags", []),
-                "type": frontmatter.get("type", "note"),
-                "date": frontmatter.get("date", ""),
+                "tags": note["tags"],
+                "type": note["type"],
+                "date": note["date"],
                 "matched_terms": terms,
             })
         except Exception:
             continue
 
-    # Sort by score
     results.sort(key=lambda x: x["score"], reverse=True)
     return results[:max_results]
 
 
 def get_note_content(note_path: str) -> dict | None:
-    """Get full content of a specific note."""
-    full_path = VAULT_PATH / note_path
-
-    if not full_path.exists():
-        # Try to find by title
-        for note_file in VAULT_PATH.rglob("*.md"):
-            if note_path.lower() in note_file.stem.lower():
-                full_path = note_file
-                break
-
-    if not full_path.exists():
+    """Get full content of a specific note from cache."""
+    note = vault_cache.get_note_by_path(note_path)
+    if not note:
         return None
 
-    content = full_path.read_text(encoding="utf-8")
-    frontmatter, body = parse_frontmatter(content)
-
-    # Extract links
-    links = re.findall(r'\[\[([^\]|]+)(?:\|[^\]]+)?\]\]', content)
-
     return {
-        "title": full_path.stem,
-        "path": str(full_path.relative_to(VAULT_PATH)),
-        "frontmatter": frontmatter,
-        "body": body,
-        "links": list(set(links)),
-        "word_count": len(body.split()),
+        "title": note["stem"],
+        "path": note["rel_path_str"],
+        "frontmatter": note["frontmatter"],
+        "body": note["body"],
+        "links": note["links"],
+        "word_count": note["word_count"],
     }
 
 
 def get_related_notes(concept: str, max_results: int = 10) -> list[dict]:
-    """Find notes related to a concept (by links, tags, or content)."""
+    """Find notes related to a concept using cached data."""
     results = []
     concept_lower = concept.lower()
 
-    for note_file in VAULT_PATH.rglob("*.md"):
-        rel_path = note_file.relative_to(VAULT_PATH)
-        if any(part.startswith("_Template") or part.startswith(".") for part in rel_path.parts):
-            continue
-
+    for note in vault_cache.get_notes():
         try:
-            content = note_file.read_text(encoding="utf-8")
-            frontmatter, body = parse_frontmatter(content)
-
             score = 0
             reasons = []
 
             # Check links
-            links = re.findall(r'\[\[([^\]|]+)(?:\|[^\]]+)?\]\]', content)
-            for link in links:
+            for link in note["links"]:
                 if concept_lower in link.lower():
                     score += 5
                     reasons.append(f"links to [[{link}]]")
 
             # Check tags
-            tags = frontmatter.get("tags", [])
-            for tag in tags:
+            for tag in note["tags"]:
                 if concept_lower in str(tag).lower():
                     score += 3
                     reasons.append(f"tagged #{tag}")
 
             # Check title
-            if concept_lower in note_file.stem.lower():
+            if concept_lower in note["stem_lower"]:
                 score += 10
                 reasons.append("title match")
 
             # Check content
-            if concept_lower in body.lower():
-                mentions = body.lower().count(concept_lower)
+            if concept_lower in note["body_lower"]:
+                mentions = note["body_lower"].count(concept_lower)
                 score += mentions
                 reasons.append(f"mentioned {mentions}x")
 
             if score > 0:
                 results.append({
-                    "title": note_file.stem,
-                    "path": str(rel_path),
+                    "title": note["stem"],
+                    "path": note["rel_path_str"],
                     "score": score,
                     "reasons": reasons[:3],
-                    "type": frontmatter.get("type", "note"),
+                    "type": note["type"],
                 })
         except Exception:
             continue
@@ -230,7 +288,7 @@ def get_related_notes(concept: str, max_results: int = 10) -> list[dict]:
 
 
 def get_vault_stats() -> dict:
-    """Get statistics about the vault."""
+    """Get statistics about the vault using cached data."""
     stats = {
         "total_notes": 0,
         "by_type": {},
@@ -243,41 +301,32 @@ def get_vault_stats() -> dict:
 
     notes_with_dates = []
 
-    for note_file in VAULT_PATH.rglob("*.md"):
-        rel_path = note_file.relative_to(VAULT_PATH)
-        if any(part.startswith(".") for part in rel_path.parts):
+    for note in vault_cache.get_notes(include_templates=False):
+        # Skip hidden
+        if any(part.startswith(".") for part in note["rel_path"].parts):
             continue
 
-        try:
-            content = note_file.read_text(encoding="utf-8")
-            frontmatter, body = parse_frontmatter(content)
+        stats["total_notes"] += 1
+        stats["total_words"] += note["word_count"]
 
-            stats["total_notes"] += 1
-            stats["total_words"] += len(body.split())
+        # Count links (including aliased)
+        all_links = re.findall(r'\[\[([^\]]+)\]\]', note["content"])
+        stats["total_links"] += len(all_links)
 
-            # Count links
-            links = re.findall(r'\[\[([^\]]+)\]\]', content)
-            stats["total_links"] += len(links)
+        # By type
+        note_type = note["type"]
+        stats["by_type"][note_type] = stats["by_type"].get(note_type, 0) + 1
 
-            # By type
-            note_type = frontmatter.get("type", "unknown")
-            stats["by_type"][note_type] = stats["by_type"].get(note_type, 0) + 1
+        # By folder
+        folder = note["rel_path"].parts[0] if len(note["rel_path"].parts) > 1 else "root"
+        stats["by_folder"][folder] = stats["by_folder"].get(folder, 0) + 1
 
-            # By folder
-            folder = rel_path.parts[0] if len(rel_path.parts) > 1 else "root"
-            stats["by_folder"][folder] = stats["by_folder"].get(folder, 0) + 1
+        # Tags
+        for tag in note["tags"]:
+            tag_str = str(tag)
+            stats["tags"][tag_str] = stats["tags"].get(tag_str, 0) + 1
 
-            # Tags
-            for tag in frontmatter.get("tags", []):
-                tag_str = str(tag)
-                stats["tags"][tag_str] = stats["tags"].get(tag_str, 0) + 1
-
-            # Track for recent
-            mtime = note_file.stat().st_mtime
-            notes_with_dates.append((note_file.stem, str(rel_path), mtime))
-
-        except Exception:
-            continue
+        notes_with_dates.append((note["stem"], note["rel_path_str"], note["mtime"]))
 
     # Recent notes
     notes_with_dates.sort(key=lambda x: x[2], reverse=True)
@@ -293,62 +342,38 @@ def get_vault_stats() -> dict:
 
 
 def explore_by_tag(tag: str) -> list[dict]:
-    """Find all notes with a specific tag."""
+    """Find all notes with a specific tag using cached data."""
     results = []
     tag_lower = tag.lower().replace("#", "")
 
-    for note_file in VAULT_PATH.rglob("*.md"):
-        rel_path = note_file.relative_to(VAULT_PATH)
-        if any(part.startswith(".") for part in rel_path.parts):
-            continue
-
-        try:
-            content = note_file.read_text(encoding="utf-8")
-            frontmatter, _ = parse_frontmatter(content)
-
-            tags = [str(t).lower() for t in frontmatter.get("tags", [])]
-
-            if any(tag_lower in t for t in tags):
-                results.append({
-                    "title": note_file.stem,
-                    "path": str(rel_path),
-                    "tags": frontmatter.get("tags", []),
-                    "type": frontmatter.get("type", "note"),
-                })
-        except Exception:
-            continue
+    for note in vault_cache.get_notes():
+        tags_lower = [str(t).lower() for t in note["tags"]]
+        if any(tag_lower in t for t in tags_lower):
+            results.append({
+                "title": note["stem"],
+                "path": note["rel_path_str"],
+                "tags": note["tags"],
+                "type": note["type"],
+            })
 
     return results
 
 
 def get_backlinks(note_title: str) -> list[dict]:
-    """Find all notes that link to a specific note."""
+    """Find all notes that link to a specific note using cached data."""
     results = []
     title_lower = note_title.lower()
 
-    for note_file in VAULT_PATH.rglob("*.md"):
-        rel_path = note_file.relative_to(VAULT_PATH)
-        if any(part.startswith(".") for part in rel_path.parts):
-            continue
-
-        try:
-            content = note_file.read_text(encoding="utf-8")
-
-            # Find links to the target note
-            links = re.findall(r'\[\[([^\]|]+)(?:\|[^\]]+)?\]\]', content)
-
-            for link in links:
-                if title_lower in link.lower():
-                    frontmatter, _ = parse_frontmatter(content)
-                    results.append({
-                        "title": note_file.stem,
-                        "path": str(rel_path),
-                        "link_text": link,
-                        "type": frontmatter.get("type", "note"),
-                    })
-                    break
-        except Exception:
-            continue
+    for note in vault_cache.get_notes():
+        for link in note["links"]:
+            if title_lower in link.lower():
+                results.append({
+                    "title": note["stem"],
+                    "path": note["rel_path_str"],
+                    "link_text": link,
+                    "type": note["type"],
+                })
+                break
 
     return results
 
@@ -495,7 +520,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         output = f"# {note['title']}\n\n"
         output += f"**Path:** {note['path']}\n"
         output += f"**Type:** {note['frontmatter'].get('type', 'unknown')}\n"
-        output += f"**Tags:** {', '.join(note['frontmatter'].get('tags', []))}\n"
+        tags_list = note['frontmatter'].get('tags', [])
+        output += f"**Tags:** {', '.join(str(t) for t in tags_list)}\n"
         output += f"**Words:** {note['word_count']}\n"
         output += f"**Links:** {', '.join(note['links'][:10])}\n\n"
         output += "---\n\n"
@@ -622,4 +648,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
