@@ -2,6 +2,7 @@
 Pytest configuration and fixtures for knowledge-assistant tests.
 """
 
+import asyncio
 import pytest
 import tempfile
 import shutil
@@ -152,22 +153,35 @@ This note uses [[Python|the Python language]] with an alias.
 
 
 @pytest.fixture
-def vault_cache(temp_vault):
+async def vault_cache(temp_vault):
     """Create a VaultCache instance with the temp vault."""
     from src.server import VaultCache
     cache = VaultCache(temp_vault, ttl=60)
-    cache.refresh(force=True)
+    await cache.refresh(force=True)
     return cache
 
 
 @pytest.fixture
-def patched_vault_cache(temp_vault, monkeypatch):
+async def patched_vault_cache(temp_vault, monkeypatch):
     """Patch the global vault_cache to use the temp vault."""
-    from src import server
+    from src import server, cache, search, writer, graph, config
     from src.server import VaultCache
 
-    cache = VaultCache(temp_vault, ttl=60)
-    cache.refresh(force=True)
-    monkeypatch.setattr(server, "vault_cache", cache)
+    test_cache = VaultCache(temp_vault, ttl=60)
+    await test_cache.refresh(force=True)
+
+    # Patch vault_cache in all modules that use it
+    monkeypatch.setattr(server, "vault_cache", test_cache)
+    monkeypatch.setattr(cache, "vault_cache", test_cache)
+    monkeypatch.setattr(search, "vault_cache", test_cache)
+    monkeypatch.setattr(writer, "vault_cache", test_cache)
+    monkeypatch.setattr(graph, "vault_cache", test_cache)
+
+    # Patch settings.vault_path in config module (used by all modules via import)
+    monkeypatch.setattr(config.settings, "vault_path", temp_vault)
+
+    # Patch the backward-compatible aliases for any code that still uses them
     monkeypatch.setattr(server, "VAULT_PATH", temp_vault)
-    return cache
+    monkeypatch.setattr(config, "VAULT_PATH", temp_vault)
+
+    return test_cache
