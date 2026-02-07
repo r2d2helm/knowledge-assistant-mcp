@@ -7,12 +7,15 @@ Features in-memory caching for fast repeated queries.
 
 import asyncio
 import json
+import logging
 import os
 import re
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 import yaml
 from mcp.server import Server
@@ -85,7 +88,7 @@ class VaultCache:
                 stem = note_file.stem
                 content_lower = content.lower()
 
-                links = re.findall(r'\[\[([^\]|]+)(?:\|[^\]]+)?\]\]', content)
+                links = WIKILINK_PATTERN.findall(content)
 
                 notes.append({
                     "path": note_file,
@@ -107,7 +110,8 @@ class VaultCache:
                     "is_template": any(part.startswith("_Template") for part in rel_path.parts),
                 })
                 stems.add(stem)
-            except Exception:
+            except Exception as e:
+                logger.warning("Failed to read note %s: %s", note_file, e)
                 continue
 
         self._notes = notes
@@ -122,8 +126,20 @@ class VaultCache:
         return [n for n in self._notes if not n["is_template"]]
 
     def get_note_by_path(self, note_path: str) -> dict | None:
-        """Find a note by relative path or title match."""
+        """Find a note by relative path or title match.
+
+        Security: Validates path to prevent directory traversal attacks.
+        """
         self.refresh()
+
+        # Security validation: reject path traversal attempts
+        if not note_path or ".." in note_path:
+            return None
+
+        # Reject absolute paths
+        if note_path.startswith("/") or (len(note_path) > 1 and note_path[1] == ":"):
+            return None
+
         # Exact path match
         for note in self._notes:
             if note["rel_path_str"] == note_path:
@@ -150,6 +166,151 @@ class VaultCache:
 vault_cache = VaultCache(VAULT_PATH, CACHE_TTL)
 
 
+# ============== Security Validation ==============
+
+# Maximum allowed content size (1MB)
+MAX_CONTENT_SIZE = 1 * 1024 * 1024  # 1MB in bytes
+
+# Maximum allowed title length
+MAX_TITLE_LENGTH = 200
+
+# Allowed characters in title (alphanumeric, spaces, hyphens, underscores, accented chars)
+TITLE_PATTERN = re.compile(r'^[\w\s\-àâäéèêëïîôùûüçÀÂÄÉÈÊËÏÎÔÙÛÜÇ]+$', re.UNICODE)
+
+# Pre-compiled regex patterns for performance
+WIKILINK_PATTERN = re.compile(r'\[\[([^\]|]+)(?:\|[^\]]+)?\]\]')
+FRONTMATTER_PATTERN = re.compile(r'^---\s*\n(.*?)\n---\s*\n', re.DOTALL)
+SEARCH_SPLIT_PATTERN = re.compile(r'[\s\-_]+')
+ALL_LINKS_PATTERN = re.compile(r'\[\[([^\]]+)\]\]')
+UNSAFE_CHARS_PATTERN = re.compile(r'[^\w\s-]')
+WHITESPACE_PATTERN = re.compile(r'[\s]+')
+WORD_SPLIT_PATTERN = re.compile(r'[\s_-]+')
+
+
+class PathValidationError(Exception):
+    """Raised when path validation fails."""
+    pass
+
+
+class TitleValidationError(Exception):
+    """Raised when title validation fails."""
+    pass
+
+
+class ContentValidationError(Exception):
+    """Raised when content validation fails."""
+    pass
+
+
+def validate_path_within_vault(path_str: str, vault_path: Path) -> Path:
+    """Validate that a path is safely within the vault directory.
+
+    Args:
+        path_str: The path string to validate (relative path or note identifier)
+        vault_path: The vault root path
+
+    Returns:
+        The validated absolute Path
+
+    Raises:
+        PathValidationError: If the path attempts to escape the vault
+    """
+    # Reject empty paths
+    if not path_str or not path_str.strip():
+        raise PathValidationError("Path cannot be empty")
+
+    # Reject paths with ".." components (path traversal attempt)
+    if ".." in path_str:
+        raise PathValidationError("Path traversal detected: '..' is not allowed")
+
+    # Reject absolute paths
+    if path_str.startswith("/") or (len(path_str) > 1 and path_str[1] == ":"):
+        raise PathValidationError("Absolute paths are not allowed")
+
+    # Build the full path and resolve it
+    full_path = (vault_path / path_str).resolve()
+    vault_resolved = vault_path.resolve()
+
+    # Verify the resolved path is within the vault
+    try:
+        full_path.relative_to(vault_resolved)
+    except ValueError:
+        raise PathValidationError(f"Path escapes vault directory: {path_str}")
+
+    return full_path
+
+
+def validate_folder_path(folder: str, vault_path: Path) -> Path:
+    """Validate a folder path for note creation.
+
+    Args:
+        folder: The folder path relative to vault
+        vault_path: The vault root path
+
+    Returns:
+        The validated folder Path
+
+    Raises:
+        PathValidationError: If the folder path is invalid or escapes the vault
+    """
+    return validate_path_within_vault(folder, vault_path)
+
+
+def validate_title(title: str) -> str:
+    """Validate and sanitize a note title.
+
+    Args:
+        title: The title to validate
+
+    Returns:
+        The validated title
+
+    Raises:
+        TitleValidationError: If the title is invalid
+    """
+    if not title or not title.strip():
+        raise TitleValidationError("Title cannot be empty")
+
+    title = title.strip()
+
+    if len(title) > MAX_TITLE_LENGTH:
+        raise TitleValidationError(f"Title exceeds maximum length of {MAX_TITLE_LENGTH} characters")
+
+    # Check for dangerous characters that could cause issues in filenames
+    # Allow alphanumeric, spaces, hyphens, underscores, and common accented characters
+    if not TITLE_PATTERN.match(title):
+        raise TitleValidationError(
+            "Title contains invalid characters. Only alphanumeric, spaces, hyphens, "
+            "underscores, and common accented characters are allowed."
+        )
+
+    return title
+
+
+def validate_content_size(content: str) -> str:
+    """Validate content size.
+
+    Args:
+        content: The content to validate
+
+    Returns:
+        The validated content
+
+    Raises:
+        ContentValidationError: If the content exceeds size limits
+    """
+    content_bytes = len(content.encode('utf-8'))
+
+    if content_bytes > MAX_CONTENT_SIZE:
+        max_mb = MAX_CONTENT_SIZE / (1024 * 1024)
+        actual_mb = content_bytes / (1024 * 1024)
+        raise ContentValidationError(
+            f"Content size ({actual_mb:.2f}MB) exceeds maximum allowed size ({max_mb}MB)"
+        )
+
+    return content
+
+
 # ============== Helper Functions ==============
 
 def load_index() -> dict:
@@ -165,7 +326,7 @@ def parse_frontmatter(content: str) -> tuple[dict, str]:
     frontmatter = {}
     body = content
 
-    match = re.match(r'^---\s*\n(.*?)\n---\s*\n', content, re.DOTALL)
+    match = FRONTMATTER_PATTERN.match(content)
     if match:
         try:
             frontmatter = yaml.safe_load(match.group(1)) or {}
@@ -185,7 +346,7 @@ def search_notes(query: str, max_results: int = 10) -> list[dict]:
     """
     results = []
 
-    terms = [t.strip().lower() for t in re.split(r'[\s\-_]+', query) if t.strip()]
+    terms = [t.strip().lower() for t in SEARCH_SPLIT_PATTERN.split(query) if t.strip()]
     if not terms:
         return []
 
@@ -232,7 +393,8 @@ def search_notes(query: str, max_results: int = 10) -> list[dict]:
                 "date": note["date"],
                 "matched_terms": terms,
             })
-        except Exception:
+        except Exception as e:
+            logger.warning("Failed to score note %s: %s", note["rel_path_str"], e)
             continue
 
     results.sort(key=lambda x: x["score"], reverse=True)
@@ -240,7 +402,21 @@ def search_notes(query: str, max_results: int = 10) -> list[dict]:
 
 
 def get_note_content(note_path: str) -> dict | None:
-    """Get full content of a specific note from cache."""
+    """Get full content of a specific note from cache.
+
+    Security: Validates path before lookup to prevent directory traversal.
+    """
+    # Early validation - reject obvious traversal attempts
+    if not note_path or ".." in note_path:
+        return None
+
+    # Additional validation for explicit path lookups
+    if "/" in note_path or "\\" in note_path:
+        try:
+            validate_path_within_vault(note_path, VAULT_PATH)
+        except PathValidationError:
+            return None
+
     note = vault_cache.get_note_by_path(note_path)
     if not note:
         return None
@@ -296,7 +472,8 @@ def get_related_notes(concept: str, max_results: int = 10) -> list[dict]:
                     "reasons": reasons[:3],
                     "type": note["type"],
                 })
-        except Exception:
+        except Exception as e:
+            logger.warning("Failed to compute relevance for note %s: %s", note["rel_path_str"], e)
             continue
 
     results.sort(key=lambda x: x["score"], reverse=True)
@@ -326,7 +503,7 @@ def get_vault_stats() -> dict:
         stats["total_words"] += note["word_count"]
 
         # Count links (including aliased)
-        all_links = re.findall(r'\[\[([^\]]+)\]\]', note["content"])
+        all_links = ALL_LINKS_PATTERN.findall(note["content"])
         stats["total_links"] += len(all_links)
 
         # By type
@@ -701,8 +878,8 @@ def generate_filename(title: str, note_type: str) -> str:
     prefix = config["prefix"].format(date=today)
 
     # Sanitize title: remove special chars, replace spaces with underscores
-    safe_title = re.sub(r'[^\w\s-]', '', title)
-    safe_title = re.sub(r'[\s]+', '_', safe_title.strip())
+    safe_title = UNSAFE_CHARS_PATTERN.sub('', title)
+    safe_title = WHITESPACE_PATTERN.sub('_', safe_title.strip())
 
     return f"{prefix}{safe_title}.md"
 
@@ -742,7 +919,7 @@ def check_duplicates(title: str, note_type: str) -> list[dict]:
     """
     duplicates = []
     title_lower = title.lower()
-    title_words = set(re.split(r'[\s_-]+', title_lower))
+    title_words = set(WORD_SPLIT_PATTERN.split(title_lower))
 
     for note in vault_cache.get_notes():
         # Check for exact title match
@@ -756,7 +933,7 @@ def check_duplicates(title: str, note_type: str) -> list[dict]:
             continue
 
         # Check for similar title (word overlap)
-        note_words = set(re.split(r'[\s_-]+', note["stem_lower"]))
+        note_words = set(WORD_SPLIT_PATTERN.split(note["stem_lower"]))
         overlap = title_words & note_words
         if len(overlap) >= 2 and len(overlap) / len(title_words) > 0.5:
             duplicates.append({
@@ -784,12 +961,39 @@ def write_note(title: str, content: str, note_type: str, tags: list[str], folder
     Returns:
         dict with status, path, and any warnings
     """
+    # === Security validations ===
+
+    # Validate title
+    try:
+        title = validate_title(title)
+    except TitleValidationError as e:
+        return {
+            "success": False,
+            "error": f"Invalid title: {str(e)}",
+        }
+
+    # Validate content size
+    try:
+        validate_content_size(content)
+    except ContentValidationError as e:
+        return {
+            "success": False,
+            "error": f"Invalid content: {str(e)}",
+        }
+
+    # Determine and validate folder path
+    target_folder = folder if folder else get_default_folder(note_type)
+
+    try:
+        folder_path = validate_folder_path(target_folder, VAULT_PATH)
+    except PathValidationError as e:
+        return {
+            "success": False,
+            "error": f"Invalid folder path: {str(e)}",
+        }
+
     # Check for potential duplicates first
     duplicates = check_duplicates(title, note_type)
-
-    # Determine folder
-    target_folder = folder if folder else get_default_folder(note_type)
-    folder_path = VAULT_PATH / target_folder
 
     # Create folder if it doesn't exist
     folder_path.mkdir(parents=True, exist_ok=True)
@@ -797,6 +1001,17 @@ def write_note(title: str, content: str, note_type: str, tags: list[str], folder
     # Generate filename
     filename = generate_filename(title, note_type)
     file_path = folder_path / filename
+
+    # Final validation: ensure the complete file path is within vault
+    try:
+        validated_file_path = validate_path_within_vault(
+            str(file_path.relative_to(VAULT_PATH.resolve())), VAULT_PATH
+        )
+    except (PathValidationError, ValueError) as e:
+        return {
+            "success": False,
+            "error": f"Invalid file path: {str(e)}",
+        }
 
     # Check if file already exists
     if file_path.exists():
@@ -1263,6 +1478,8 @@ async def read_resource(uri: str) -> str:
 def main():
     """Main entry point."""
     import sys
+
+    logging.basicConfig(level=logging.WARNING)
 
     async def run():
         async with stdio_server() as (read_stream, write_stream):

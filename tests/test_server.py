@@ -892,3 +892,604 @@ class TestGetClusters:
         assert "total_nodes" in result["stats"]
         assert "total_edges" in result["stats"]
         assert "orphan_count" in result["stats"]
+
+
+# ============== Tests for Security Validations ==============
+
+class TestPathValidation:
+    """Tests for path traversal protection."""
+
+    def test_validate_path_rejects_double_dots(self, temp_vault):
+        """Test that '..' in paths is rejected."""
+        from src.server import validate_path_within_vault, PathValidationError
+
+        with pytest.raises(PathValidationError, match="Path traversal detected"):
+            validate_path_within_vault("../../../etc/passwd", temp_vault)
+
+    def test_validate_path_rejects_hidden_double_dots(self, temp_vault):
+        """Test that '..' anywhere in path is rejected."""
+        from src.server import validate_path_within_vault, PathValidationError
+
+        with pytest.raises(PathValidationError, match="Path traversal detected"):
+            validate_path_within_vault("Concepts/../../etc", temp_vault)
+
+    def test_validate_path_rejects_absolute_paths(self, temp_vault):
+        """Test that absolute paths are rejected."""
+        from src.server import validate_path_within_vault, PathValidationError
+
+        with pytest.raises(PathValidationError, match="Absolute paths are not allowed"):
+            validate_path_within_vault("/etc/passwd", temp_vault)
+
+    def test_validate_path_rejects_windows_absolute_paths(self, temp_vault):
+        """Test that Windows absolute paths are rejected."""
+        from src.server import validate_path_within_vault, PathValidationError
+
+        with pytest.raises(PathValidationError, match="Absolute paths are not allowed"):
+            validate_path_within_vault("C:\\Windows\\System32", temp_vault)
+
+    def test_validate_path_rejects_empty_path(self, temp_vault):
+        """Test that empty paths are rejected."""
+        from src.server import validate_path_within_vault, PathValidationError
+
+        with pytest.raises(PathValidationError, match="Path cannot be empty"):
+            validate_path_within_vault("", temp_vault)
+
+    def test_validate_path_allows_valid_path(self, temp_vault):
+        """Test that valid relative paths are accepted."""
+        from src.server import validate_path_within_vault
+
+        result = validate_path_within_vault("Concepts/C_Python.md", temp_vault)
+        assert result.is_relative_to(temp_vault.resolve())
+
+    def test_validate_folder_path_rejects_traversal(self, temp_vault):
+        """Test folder path validation rejects traversal."""
+        from src.server import validate_folder_path, PathValidationError
+
+        with pytest.raises(PathValidationError):
+            validate_folder_path("../../../etc", temp_vault)
+
+    def test_validate_folder_path_allows_valid_folder(self, temp_vault):
+        """Test folder path validation accepts valid paths."""
+        from src.server import validate_folder_path
+
+        result = validate_folder_path("Concepts", temp_vault)
+        assert result.is_relative_to(temp_vault.resolve())
+
+
+class TestTitleValidation:
+    """Tests for title sanitization."""
+
+    def test_validate_title_rejects_empty(self):
+        """Test that empty titles are rejected."""
+        from src.server import validate_title, TitleValidationError
+
+        with pytest.raises(TitleValidationError, match="Title cannot be empty"):
+            validate_title("")
+
+    def test_validate_title_rejects_whitespace_only(self):
+        """Test that whitespace-only titles are rejected."""
+        from src.server import validate_title, TitleValidationError
+
+        with pytest.raises(TitleValidationError, match="Title cannot be empty"):
+            validate_title("   ")
+
+    def test_validate_title_rejects_too_long(self):
+        """Test that titles exceeding max length are rejected."""
+        from src.server import validate_title, TitleValidationError, MAX_TITLE_LENGTH
+
+        long_title = "A" * (MAX_TITLE_LENGTH + 1)
+        with pytest.raises(TitleValidationError, match="exceeds maximum length"):
+            validate_title(long_title)
+
+    def test_validate_title_rejects_special_chars(self):
+        """Test that titles with dangerous chars are rejected."""
+        from src.server import validate_title, TitleValidationError
+
+        # Path-like characters
+        with pytest.raises(TitleValidationError, match="invalid characters"):
+            validate_title("../../../etc")
+
+        with pytest.raises(TitleValidationError, match="invalid characters"):
+            validate_title("test<script>")
+
+    def test_validate_title_allows_valid_titles(self):
+        """Test that valid titles are accepted."""
+        from src.server import validate_title
+
+        assert validate_title("My Note Title") == "My Note Title"
+        assert validate_title("Test-Note_123") == "Test-Note_123"
+        assert validate_title("Note avec accents éàù") == "Note avec accents éàù"
+
+    def test_validate_title_strips_whitespace(self):
+        """Test that titles are trimmed."""
+        from src.server import validate_title
+
+        assert validate_title("  My Title  ") == "My Title"
+
+
+class TestContentValidation:
+    """Tests for content size limits."""
+
+    def test_validate_content_rejects_too_large(self):
+        """Test that content exceeding max size is rejected."""
+        from src.server import validate_content_size, ContentValidationError, MAX_CONTENT_SIZE
+
+        large_content = "A" * (MAX_CONTENT_SIZE + 1)
+        with pytest.raises(ContentValidationError, match="exceeds maximum allowed size"):
+            validate_content_size(large_content)
+
+    def test_validate_content_allows_valid_size(self):
+        """Test that valid content size is accepted."""
+        from src.server import validate_content_size
+
+        content = "Normal sized content"
+        assert validate_content_size(content) == content
+
+
+class TestWriteNoteSecure:
+    """Tests for write_note with security validations."""
+
+    def test_write_note_rejects_folder_traversal(self, patched_vault_cache):
+        """Test write_note rejects path traversal in folder."""
+        from src.server import write_note
+
+        result = write_note(
+            title="Test Note",
+            content="Content",
+            note_type="concept",
+            tags=["test"],
+            folder="../../../etc"
+        )
+
+        assert result["success"] is False
+        assert "Invalid folder path" in result["error"]
+
+    def test_write_note_rejects_absolute_folder(self, patched_vault_cache):
+        """Test write_note rejects absolute paths in folder."""
+        from src.server import write_note
+
+        result = write_note(
+            title="Test Note",
+            content="Content",
+            note_type="concept",
+            tags=["test"],
+            folder="/etc/passwd"
+        )
+
+        assert result["success"] is False
+        assert "Invalid folder path" in result["error"]
+
+    def test_write_note_rejects_invalid_title(self, patched_vault_cache):
+        """Test write_note rejects dangerous title."""
+        from src.server import write_note
+
+        result = write_note(
+            title="../../../etc/passwd",
+            content="Content",
+            note_type="concept",
+            tags=["test"]
+        )
+
+        assert result["success"] is False
+        assert "Invalid title" in result["error"]
+
+    def test_write_note_rejects_too_large_content(self, patched_vault_cache):
+        """Test write_note rejects content exceeding size limit."""
+        from src.server import write_note, MAX_CONTENT_SIZE
+
+        large_content = "A" * (MAX_CONTENT_SIZE + 1)
+        result = write_note(
+            title="Large Note",
+            content=large_content,
+            note_type="concept",
+            tags=["test"]
+        )
+
+        assert result["success"] is False
+        assert "Invalid content" in result["error"]
+
+    def test_write_note_succeeds_with_valid_inputs(self, patched_vault_cache, temp_vault):
+        """Test write_note works with valid, secure inputs."""
+        from src.server import write_note
+
+        result = write_note(
+            title="Valid Secure Note",
+            content="This is valid content",
+            note_type="concept",
+            tags=["test"]
+        )
+
+        assert result["success"] is True
+        assert "C_Valid_Secure_Note.md" in result["filename"]
+
+        # Verify file was created in the correct location
+        created_file = temp_vault / result["path"]
+        assert created_file.exists()
+
+
+class TestGetNoteSecure:
+    """Tests for get_note_content with security validations."""
+
+    def test_get_note_rejects_traversal_path(self, patched_vault_cache):
+        """Test get_note_content rejects path traversal."""
+        from src.server import get_note_content
+
+        result = get_note_content("../../../etc/passwd")
+
+        assert result is None
+
+    def test_get_note_by_path_rejects_traversal(self, vault_cache):
+        """Test VaultCache.get_note_by_path rejects traversal."""
+        result = vault_cache.get_note_by_path("../../../etc/passwd")
+
+        assert result is None
+
+    def test_get_note_by_path_rejects_absolute_path(self, vault_cache):
+        """Test VaultCache.get_note_by_path rejects absolute paths."""
+        result = vault_cache.get_note_by_path("/etc/passwd")
+
+        assert result is None
+
+    def test_get_note_by_path_rejects_empty(self, vault_cache):
+        """Test VaultCache.get_note_by_path rejects empty paths."""
+        result = vault_cache.get_note_by_path("")
+
+        assert result is None
+
+    def test_get_note_succeeds_with_valid_path(self, vault_cache):
+        """Test get_note works with valid paths."""
+        result = vault_cache.get_note_by_path("Concepts/C_Python.md")
+
+        assert result is not None
+        assert result["stem"] == "C_Python"
+
+
+# ============== Tests for Path Traversal Security ==============
+
+class TestPathTraversalSecurity:
+    """Tests for path traversal protection in write_note function."""
+
+    def test_path_traversal_dot_dot(self, patched_vault_cache):
+        """Test write_note with folder='../../../etc' must fail."""
+        from src.server import write_note
+
+        result = write_note(
+            title="Malicious Note",
+            content="This should not be created",
+            note_type="concept",
+            tags=["test"],
+            folder="../../../etc"
+        )
+
+        assert result["success"] is False
+        assert "Invalid folder path" in result["error"]
+
+    def test_absolute_path_blocked(self, patched_vault_cache):
+        """Test folder='/etc/passwd' must fail."""
+        from src.server import write_note
+
+        result = write_note(
+            title="Absolute Path Attack",
+            content="This should not be created",
+            note_type="concept",
+            tags=["test"],
+            folder="/etc/passwd"
+        )
+
+        assert result["success"] is False
+        assert "Invalid folder path" in result["error"]
+
+    def test_windows_traversal(self, patched_vault_cache):
+        """Test folder='..\\..\\Windows' must fail."""
+        from src.server import write_note
+
+        result = write_note(
+            title="Windows Traversal Attack",
+            content="This should not be created",
+            note_type="concept",
+            tags=["test"],
+            folder="..\\..\\Windows"
+        )
+
+        assert result["success"] is False
+        assert "Invalid folder path" in result["error"]
+
+    def test_valid_subfolder_allowed(self, patched_vault_cache, temp_vault):
+        """Test folder='Concepts/SubDir' must work."""
+        from src.server import write_note
+
+        result = write_note(
+            title="Valid Subfolder Note",
+            content="This should be created successfully",
+            note_type="concept",
+            tags=["test"],
+            folder="Concepts/SubDir"
+        )
+
+        assert result["success"] is True
+        assert "Concepts/SubDir" in result["path"]
+
+        # Verify the subfolder was created and file exists
+        created_file = temp_vault / result["path"]
+        assert created_file.exists()
+
+        # Verify the subfolder is within the vault
+        assert created_file.is_relative_to(temp_vault)
+
+
+# ============== Comprehensive Tests for write_note() ==============
+
+class TestWriteNote:
+    """Comprehensive tests for the write_note function."""
+
+    def test_write_concept_note(self, patched_vault_cache, temp_vault):
+        """Test creating a concept note - verify file, frontmatter, and C_ naming."""
+        from src.server import write_note, parse_frontmatter
+
+        result = write_note(
+            title="Test Concept",
+            content="# Test Concept\n\nThis is a test concept note.",
+            note_type="concept",
+            tags=["testing", "unit-test"],
+            related=["Python"]
+        )
+
+        assert result["success"] is True
+        assert result["filename"] == "C_Test_Concept.md"
+        assert result["folder"] == "Concepts"
+
+        # Verify file exists
+        file_path = temp_vault / result["path"]
+        assert file_path.exists()
+
+        # Verify frontmatter
+        content = file_path.read_text(encoding="utf-8")
+        frontmatter, body = parse_frontmatter(content)
+
+        assert frontmatter["title"] == "Test Concept"
+        assert frontmatter["type"] == "concept"
+        assert frontmatter["status"] == "seedling"
+        assert frontmatter["tags"] == ["testing", "unit-test"]
+        assert frontmatter["related"] == ["Python"]
+        assert "# Test Concept" in body
+
+    def test_write_conversation_note(self, patched_vault_cache, temp_vault):
+        """Test creating a conversation note - verify YYYY-MM-DD_Conv_ prefix."""
+        from src.server import write_note
+        from datetime import datetime
+
+        today = datetime.now().strftime("%Y-%m-%d")
+
+        result = write_note(
+            title="Claude Setup",
+            content="# Setup session\n\nDiscussion about Claude configuration.",
+            note_type="conversation",
+            tags=["claude", "setup"]
+        )
+
+        assert result["success"] is True
+        assert result["filename"] == f"{today}_Conv_Claude_Setup.md"
+        assert result["folder"] == "Conversations"
+
+        # Verify file exists with correct name format
+        file_path = temp_vault / result["path"]
+        assert file_path.exists()
+        assert file_path.stem.startswith(f"{today}_Conv_")
+
+    def test_write_duplicate_detection(self, patched_vault_cache, temp_vault):
+        """Test creating two similar notes - verify warning about duplicates."""
+        from src.server import write_note
+
+        # Create first note
+        result1 = write_note(
+            title="Duplicate Test",
+            content="First note content",
+            note_type="concept",
+            tags=["test"]
+        )
+        assert result1["success"] is True
+
+        # Create second note with similar title
+        result2 = write_note(
+            title="Duplicate Test Extended",
+            content="Second note with similar title",
+            note_type="concept",
+            tags=["test"]
+        )
+
+        # Second note should succeed but have warnings about potential duplicates
+        assert result2["success"] is True
+        assert "warnings" in result2
+        assert "potential_duplicates" in result2["warnings"]
+
+        # Find the first note in the duplicates list
+        duplicates = result2["warnings"]["potential_duplicates"]
+        assert len(duplicates) >= 1
+        assert any("Duplicate" in d["title"] for d in duplicates)
+
+    def test_write_cache_invalidation(self, patched_vault_cache, temp_vault):
+        """Test that after writing, the cache contains the new note."""
+        from src.server import write_note, vault_cache
+
+        # Get initial stems
+        initial_stems = vault_cache.note_stems.copy()
+
+        # Create a new note
+        result = write_note(
+            title="Cache Test Note",
+            content="Testing cache invalidation",
+            note_type="concept",
+            tags=["test"]
+        )
+
+        assert result["success"] is True
+
+        # Cache should now contain the new note
+        new_stems = vault_cache.note_stems
+        assert "C_Cache_Test_Note" in new_stems
+        assert len(new_stems) > len(initial_stems)
+
+    def test_write_existing_file_fails(self, patched_vault_cache, temp_vault):
+        """Test that writing to an existing file returns success=False."""
+        from src.server import write_note
+
+        # Create first note
+        result1 = write_note(
+            title="Existing File Test",
+            content="First content",
+            note_type="concept",
+            tags=["test"]
+        )
+        assert result1["success"] is True
+
+        # Try to create the same note again
+        result2 = write_note(
+            title="Existing File Test",
+            content="Different content",
+            note_type="concept",
+            tags=["test"]
+        )
+
+        assert result2["success"] is False
+        assert "File already exists" in result2["error"]
+
+
+# ============== Comprehensive Tests for Knowledge Graph ==============
+
+class TestKnowledgeGraph:
+    """Comprehensive tests for the knowledge_graph functionality."""
+
+    def test_build_graph_basic(self, patched_vault_cache):
+        """Test graph with linked notes - verify nodes and edges."""
+        from src.server import build_graph
+
+        result = build_graph()
+
+        # Verify structure
+        assert "nodes" in result
+        assert "edges" in result
+        assert "orphans" in result
+        assert "stats" in result
+
+        # We expect nodes for all non-template notes
+        node_ids = [n["id"] for n in result["nodes"]]
+        assert "C_Python" in node_ids
+        assert "C_JavaScript" in node_ids
+        assert "R_Docker" in node_ids
+
+        # We expect edges from JavaScript -> Python and JavaScript -> Docker
+        js_edges = [e for e in result["edges"] if e["source"] == "C_JavaScript"]
+        assert len(js_edges) >= 2  # Links to Python and Docker
+
+        # Verify edge from JavaScript to Python exists
+        js_to_python = any(
+            e["source"] == "C_JavaScript" and e["target"] == "C_Python"
+            for e in result["edges"]
+        )
+        assert js_to_python
+
+    def test_subgraph_depth(self, patched_vault_cache):
+        """Test subgraph with depth 1 vs depth 2."""
+        from src.server import get_subgraph
+
+        # Get subgraph with depth 1
+        depth1_result = get_subgraph("C_Python", depth=1)
+        assert "error" not in depth1_result
+
+        # Get subgraph with depth 2
+        depth2_result = get_subgraph("C_Python", depth=2)
+        assert "error" not in depth2_result
+
+        # Depth 2 should have >= nodes than depth 1
+        assert len(depth2_result["nodes"]) >= len(depth1_result["nodes"])
+
+        # Depth 1 should include immediate neighbors only
+        depth1_node_ids = {n["id"] for n in depth1_result["nodes"]}
+        assert "C_Python" in depth1_node_ids  # Center
+        assert "C_JavaScript" in depth1_node_ids  # Links to Python
+
+        # Verify stats reflect the requested depth
+        assert depth1_result["stats"]["depth"] == 1
+        assert depth2_result["stats"]["depth"] == 2
+
+    def test_orphan_detection(self, patched_vault_cache):
+        """Test that notes without links are detected as orphans."""
+        from src.server import build_graph
+
+        result = build_graph()
+
+        # Notes without any connections should be in orphans list
+        assert "orphans" in result
+        assert isinstance(result["orphans"], list)
+
+        # Get all node IDs
+        all_node_ids = {n["id"] for n in result["nodes"]}
+
+        # Orphans should have zero connections
+        for orphan in result["orphans"]:
+            assert orphan["id"] in all_node_ids
+            # Find the node in nodes list and verify zero connections
+            node = next((n for n in result["nodes"] if n["id"] == orphan["id"]), None)
+            assert node is not None
+            assert node["connections"] == 0
+
+    def test_clusters_ordering(self, patched_vault_cache):
+        """Test that clusters are sorted by number of connections (descending)."""
+        from src.server import get_clusters
+
+        result = get_clusters()
+
+        assert "clusters" in result
+        clusters = result["clusters"]
+
+        if len(clusters) >= 2:
+            # Verify clusters are sorted by connections (descending)
+            connections = [c["hub"]["connections"] for c in clusters]
+            assert connections == sorted(connections, reverse=True)
+
+        # Verify stats structure
+        assert "stats" in result
+        assert "total_clusters" in result["stats"]
+        assert "total_nodes" in result["stats"]
+        assert "total_edges" in result["stats"]
+        assert "orphan_count" in result["stats"]
+
+    def test_graph_edge_bidirectionality(self, patched_vault_cache):
+        """Test that edges correctly represent directional links."""
+        from src.server import build_graph
+
+        result = build_graph()
+
+        # JavaScript links to Python (not the other way around)
+        js_to_python = any(
+            e["source"] == "C_JavaScript" and e["target"] == "C_Python"
+            for e in result["edges"]
+        )
+        assert js_to_python
+
+        # Python links to JavaScript (in related frontmatter)
+        # Note: Python has related: [JavaScript] but that's in frontmatter, not a wikilink
+        # The actual [[JavaScript]] link in Python.md body creates the edge
+        python_to_js = any(
+            e["source"] == "C_Python" and e["target"] == "C_JavaScript"
+            for e in result["edges"]
+        )
+        # Python does link to JavaScript via [[JavaScript]] in body
+        assert python_to_js
+
+    def test_graph_connection_counting(self, patched_vault_cache):
+        """Test that connection counts are calculated correctly."""
+        from src.server import build_graph
+
+        result = build_graph()
+
+        # Find Python node - it's linked by JavaScript and has outgoing links
+        python_node = next((n for n in result["nodes"] if n["id"] == "C_Python"), None)
+        assert python_node is not None
+        # Python should have at least 1 connection (linked by JavaScript)
+        assert python_node["connections"] >= 1
+
+        # JavaScript links to both Python and Docker
+        js_node = next((n for n in result["nodes"] if n["id"] == "C_JavaScript"), None)
+        assert js_node is not None
+        assert js_node["connections"] >= 2  # Links to Python and Docker
