@@ -23,6 +23,8 @@ Serveur MCP (Model Context Protocol) pour interroger un vault Obsidian depuis Cl
 
 ### Configuration Claude Code
 
+#### Linux/macOS
+
 Ajouter dans `~/.claude/settings.json` :
 
 ```json
@@ -34,11 +36,40 @@ Ajouter dans `~/.claude/settings.json` :
       "args": [
         "run",
         "--directory",
-        "C:\\Users\\r2d2\\.claude\\mcp-servers\\knowledge-assistant",
+        "/path/to/knowledge-assistant-mcp",
         "python",
         "-m",
         "src.server"
-      ]
+      ],
+      "env": {
+        "KNOWLEDGE_VAULT_PATH": "/home/username/Documents/Knowledge",
+        "KNOWLEDGE_INDEX_PATH": "/home/username/.knowledge/notes-index.json"
+      }
+    }
+  }
+}
+```
+
+#### Windows
+
+```json
+{
+  "mcpServers": {
+    "knowledge-assistant": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "C:\\path\\to\\knowledge-assistant-mcp",
+        "python",
+        "-m",
+        "src.server"
+      ],
+      "env": {
+        "KNOWLEDGE_VAULT_PATH": "C:\\Users\\username\\Documents\\Knowledge",
+        "KNOWLEDGE_INDEX_PATH": "C:\\Users\\username\\.knowledge\\notes-index.json"
+      }
     }
   }
 }
@@ -73,11 +104,13 @@ knowledge_explore_tag("dev/powershell")
 
 ## Configuration
 
-Le chemin du vault est défini dans `src/server.py` :
+Les chemins sont configurables via variables d'environnement :
 
-```python
-VAULT_PATH = Path(r"C:\Users\r2d2\Documents\Knowledge")
-```
+| Variable | Description | Défaut Linux/macOS | Défaut Windows |
+|----------|-------------|---------------------|----------------|
+| `KNOWLEDGE_VAULT_PATH` | Chemin du vault Obsidian | `~/Documents/Knowledge` | `%USERPROFILE%\Documents\Knowledge` |
+| `KNOWLEDGE_INDEX_PATH` | Chemin du fichier d'index | `~/.knowledge/notes-index.json` | `%USERPROFILE%\.knowledge\notes-index.json` |
+| `KNOWLEDGE_CACHE_TTL` | Durée du cache en secondes | `60` | `60` |
 
 ## Structure du Vault
 

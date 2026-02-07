@@ -24,9 +24,25 @@ from mcp.types import (
     ResourceTemplate,
 )
 
-# Configuration
-VAULT_PATH = Path(os.environ.get("KNOWLEDGE_VAULT_PATH", r"C:\Users\r2d2\Documents\Knowledge"))
-INDEX_PATH = Path(os.environ.get("KNOWLEDGE_INDEX_PATH", r"C:\Users\r2d2\.claude\skills\knowledge-watcher-skill\data\notes-index.json"))
+# Configuration - Cross-platform default paths
+def _get_default_vault_path() -> Path:
+    """Get default vault path based on platform."""
+    if os.name == "nt":  # Windows
+        return Path.home() / "Documents" / "Knowledge"
+    else:  # Linux/macOS
+        return Path.home() / "Documents" / "Knowledge"
+
+
+def _get_default_index_path() -> Path:
+    """Get default index path based on platform."""
+    if os.name == "nt":  # Windows
+        return Path.home() / ".claude" / "skills" / "knowledge-watcher-skill" / "data" / "notes-index.json"
+    else:  # Linux/macOS
+        return Path.home() / ".knowledge" / "notes-index.json"
+
+
+VAULT_PATH = Path(os.environ.get("KNOWLEDGE_VAULT_PATH", str(_get_default_vault_path())))
+INDEX_PATH = Path(os.environ.get("KNOWLEDGE_INDEX_PATH", str(_get_default_index_path())))
 CACHE_TTL = int(os.environ.get("KNOWLEDGE_CACHE_TTL", "60"))  # seconds
 
 # Initialize server
@@ -378,6 +394,450 @@ def get_backlinks(note_title: str) -> list[dict]:
     return results
 
 
+# ============== Graph Functions ==============
+
+def _find_note_by_link(link: str, stem_to_note: dict[str, dict]) -> dict | None:
+    """Find a note by link text, handling partial matches.
+
+    Link text may be:
+    - Exact stem match: "C_Python" -> C_Python
+    - Partial match: "Python" -> C_Python (if stem contains "python")
+    """
+    link_lower = link.lower()
+
+    # Exact match first
+    if link_lower in stem_to_note:
+        return stem_to_note[link_lower]
+
+    # Partial match: link text is contained in stem
+    for stem, note in stem_to_note.items():
+        if link_lower in stem:
+            return note
+
+    return None
+
+
+def build_graph() -> dict:
+    """Build a complete graph of all notes and their links.
+
+    Returns:
+        dict with:
+        - nodes: list of {id, title, path, type, connections}
+        - edges: list of {source, target}
+        - orphans: list of notes with no links
+        - stats: global graph statistics
+    """
+    notes = vault_cache.get_notes()
+
+    # Build a mapping of note stems (lowercase) to note data
+    stem_to_note: dict[str, dict] = {}
+    for note in notes:
+        stem_to_note[note["stem_lower"]] = note
+
+    nodes = []
+    edges = []
+    orphans = []
+
+    # Track connections per note
+    connection_counts: dict[str, int] = {}
+
+    for note in notes:
+        note_id = note["stem"]
+
+        # Count outgoing links
+        outgoing = 0
+        for link in note["links"]:
+            # Find the target note (handles partial matches)
+            target_note = _find_note_by_link(link, stem_to_note)
+            if target_note:
+                edges.append({
+                    "source": note_id,
+                    "target": target_note["stem"],
+                })
+                outgoing += 1
+                # Increment target's incoming count
+                target_stem = target_note["stem"]
+                connection_counts[target_stem] = connection_counts.get(target_stem, 0) + 1
+
+        connection_counts[note_id] = connection_counts.get(note_id, 0) + outgoing
+
+    # Build nodes with connection counts
+    for note in notes:
+        note_id = note["stem"]
+        conn_count = connection_counts.get(note_id, 0)
+
+        node = {
+            "id": note_id,
+            "title": note["stem"],
+            "path": note["rel_path_str"],
+            "type": note["type"],
+            "connections": conn_count,
+        }
+        nodes.append(node)
+
+        # Orphan = no outgoing links AND no incoming links
+        if conn_count == 0:
+            orphans.append({
+                "id": note_id,
+                "title": note["stem"],
+                "path": note["rel_path_str"],
+                "type": note["type"],
+            })
+
+    stats = {
+        "total_nodes": len(nodes),
+        "total_edges": len(edges),
+        "orphan_count": len(orphans),
+        "avg_connections": round(sum(connection_counts.values()) / len(nodes), 2) if nodes else 0,
+    }
+
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "orphans": orphans,
+        "stats": stats,
+    }
+
+
+def get_subgraph(center_note: str, depth: int = 2) -> dict:
+    """Get a subgraph centered on a specific note.
+
+    Args:
+        center_note: Title or path of the center note
+        depth: How many levels of connections to include (default: 2)
+
+    Returns:
+        dict with nodes[], edges[], center, and stats
+    """
+    notes = vault_cache.get_notes()
+
+    # Build stem mappings
+    stem_to_note: dict[str, dict] = {}
+    for note in notes:
+        stem_to_note[note["stem_lower"]] = note
+
+    # Find center note
+    center_lower = center_note.lower()
+    center_data = None
+
+    # Try exact match first
+    if center_lower in stem_to_note:
+        center_data = stem_to_note[center_lower]
+    else:
+        # Try partial match
+        for stem, note in stem_to_note.items():
+            if center_lower in stem:
+                center_data = note
+                break
+
+    if not center_data:
+        return {"error": f"Note not found: {center_note}"}
+
+    center_id = center_data["stem"]
+
+    # BFS to find all nodes within depth
+    visited: set[str] = {center_id}
+    frontier: set[str] = {center_id}
+    subgraph_nodes: dict[str, dict] = {center_id: center_data}
+
+    # Build reverse links (backlinks) using the same matching logic
+    backlinks: dict[str, list[str]] = {}
+    for note in notes:
+        for link in note["links"]:
+            target_note = _find_note_by_link(link, stem_to_note)
+            if target_note:
+                target_stem = target_note["stem"]
+                if target_stem not in backlinks:
+                    backlinks[target_stem] = []
+                backlinks[target_stem].append(note["stem"])
+
+    for _ in range(depth):
+        new_frontier: set[str] = set()
+
+        for node_id in frontier:
+            node_data = stem_to_note.get(node_id.lower())
+            if not node_data:
+                continue
+
+            # Outgoing links
+            for link in node_data["links"]:
+                target_note = _find_note_by_link(link, stem_to_note)
+                if target_note:
+                    target_stem = target_note["stem"]
+                    if target_stem not in visited:
+                        visited.add(target_stem)
+                        new_frontier.add(target_stem)
+                        subgraph_nodes[target_stem] = target_note
+
+            # Incoming links (backlinks)
+            if node_id in backlinks:
+                for source_id in backlinks[node_id]:
+                    if source_id not in visited:
+                        visited.add(source_id)
+                        new_frontier.add(source_id)
+                        subgraph_nodes[source_id] = stem_to_note[source_id.lower()]
+
+        frontier = new_frontier
+
+    # Build edges for the subgraph
+    edges = []
+    for node_id, node_data in subgraph_nodes.items():
+        for link in node_data["links"]:
+            target_note = _find_note_by_link(link, stem_to_note)
+            if target_note and target_note["stem"] in subgraph_nodes:
+                edges.append({
+                    "source": node_id,
+                    "target": target_note["stem"],
+                })
+
+    # Build nodes list with connection counts within subgraph
+    nodes = []
+    for node_id, node_data in subgraph_nodes.items():
+        conn_count = sum(1 for e in edges if e["source"] == node_id or e["target"] == node_id)
+        nodes.append({
+            "id": node_id,
+            "title": node_data["stem"],
+            "path": node_data["rel_path_str"],
+            "type": node_data["type"],
+            "connections": conn_count,
+            "is_center": node_id == center_id,
+        })
+
+    stats = {
+        "total_nodes": len(nodes),
+        "total_edges": len(edges),
+        "depth": depth,
+        "center": center_id,
+    }
+
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "center": center_id,
+        "stats": stats,
+    }
+
+
+def get_clusters(top_n: int = 10) -> dict:
+    """Get the most connected clusters in the graph.
+
+    Returns the top N most connected notes and their immediate neighbors.
+
+    Args:
+        top_n: Number of top connected notes to return (default: 10)
+
+    Returns:
+        dict with clusters[], stats
+    """
+    graph = build_graph()
+
+    # Sort nodes by connections
+    sorted_nodes = sorted(graph["nodes"], key=lambda x: x["connections"], reverse=True)
+    top_nodes = sorted_nodes[:top_n]
+
+    # Build clusters for each top node
+    clusters = []
+    for node in top_nodes:
+        # Find immediate neighbors (connected nodes)
+        neighbors = set()
+        for edge in graph["edges"]:
+            if edge["source"] == node["id"]:
+                neighbors.add(edge["target"])
+            elif edge["target"] == node["id"]:
+                neighbors.add(edge["source"])
+
+        clusters.append({
+            "hub": {
+                "id": node["id"],
+                "title": node["title"],
+                "path": node["path"],
+                "type": node["type"],
+                "connections": node["connections"],
+            },
+            "neighbors": list(neighbors),
+            "neighbor_count": len(neighbors),
+        })
+
+    stats = {
+        "total_clusters": len(clusters),
+        "total_nodes": graph["stats"]["total_nodes"],
+        "total_edges": graph["stats"]["total_edges"],
+        "orphan_count": graph["stats"]["orphan_count"],
+    }
+
+    return {
+        "clusters": clusters,
+        "orphans": graph["orphans"],
+        "stats": stats,
+    }
+
+
+# ============== Write Functions ==============
+
+# Mapping of note types to naming prefixes and default folders
+NOTE_TYPE_CONFIG = {
+    "concept": {"prefix": "C_", "folder": "Concepts"},
+    "conversation": {"prefix": "{date}_Conv_", "folder": "Conversations"},
+    "troubleshooting": {"prefix": "{date}_Fix_", "folder": "Troubleshooting"},
+    "session": {"prefix": "{date}_Session_", "folder": "Sessions"},
+    "reference": {"prefix": "R_", "folder": "References"},
+    "project": {"prefix": "P_", "folder": "Projects"},
+}
+
+
+def generate_filename(title: str, note_type: str) -> str:
+    """Generate filename based on note type and naming conventions.
+
+    Conventions:
+    - concept: C_<title>.md
+    - conversation: YYYY-MM-DD_Conv_<title>.md
+    - troubleshooting: YYYY-MM-DD_Fix_<title>.md
+    - session: YYYY-MM-DD_Session_<title>.md
+    - reference: R_<title>.md
+    - project: P_<title>.md
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    config = NOTE_TYPE_CONFIG.get(note_type, {"prefix": "", "folder": "Notes"})
+    prefix = config["prefix"].format(date=today)
+
+    # Sanitize title: remove special chars, replace spaces with underscores
+    safe_title = re.sub(r'[^\w\s-]', '', title)
+    safe_title = re.sub(r'[\s]+', '_', safe_title.strip())
+
+    return f"{prefix}{safe_title}.md"
+
+
+def get_default_folder(note_type: str) -> str:
+    """Get default folder for a note type."""
+    config = NOTE_TYPE_CONFIG.get(note_type, {"folder": "Notes"})
+    return config["folder"]
+
+
+def generate_frontmatter(title: str, note_type: str, tags: list[str], related: list[str] | None = None) -> str:
+    """Generate YAML frontmatter for a note.
+
+    Required fields: title, date, type, status, tags, related
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    frontmatter = {
+        "title": title,
+        "date": today,
+        "type": note_type,
+        "status": "seedling",
+        "tags": tags if tags else [],
+        "related": related if related else [],
+    }
+
+    yaml_content = yaml.dump(frontmatter, allow_unicode=True, default_flow_style=False, sort_keys=False)
+    return f"---\n{yaml_content}---\n\n"
+
+
+def check_duplicates(title: str, note_type: str) -> list[dict]:
+    """Check for potential duplicate notes.
+
+    Returns a list of notes that might be duplicates based on:
+    - Similar title (case-insensitive)
+    - Same type with similar content keywords
+    """
+    duplicates = []
+    title_lower = title.lower()
+    title_words = set(re.split(r'[\s_-]+', title_lower))
+
+    for note in vault_cache.get_notes():
+        # Check for exact title match
+        if note["stem_lower"] == title_lower:
+            duplicates.append({
+                "title": note["stem"],
+                "path": note["rel_path_str"],
+                "type": note["type"],
+                "match_type": "exact_title",
+            })
+            continue
+
+        # Check for similar title (word overlap)
+        note_words = set(re.split(r'[\s_-]+', note["stem_lower"]))
+        overlap = title_words & note_words
+        if len(overlap) >= 2 and len(overlap) / len(title_words) > 0.5:
+            duplicates.append({
+                "title": note["stem"],
+                "path": note["rel_path_str"],
+                "type": note["type"],
+                "match_type": "similar_title",
+                "common_words": list(overlap),
+            })
+
+    return duplicates[:5]  # Return at most 5 potential duplicates
+
+
+def write_note(title: str, content: str, note_type: str, tags: list[str], folder: str | None = None, related: list[str] | None = None) -> dict:
+    """Create a new note in the vault.
+
+    Args:
+        title: Note title
+        content: Note body content (markdown)
+        note_type: Type of note (concept, conversation, troubleshooting, etc.)
+        tags: List of tags
+        folder: Optional folder path (defaults based on type)
+        related: Optional list of related note titles
+
+    Returns:
+        dict with status, path, and any warnings
+    """
+    # Check for potential duplicates first
+    duplicates = check_duplicates(title, note_type)
+
+    # Determine folder
+    target_folder = folder if folder else get_default_folder(note_type)
+    folder_path = VAULT_PATH / target_folder
+
+    # Create folder if it doesn't exist
+    folder_path.mkdir(parents=True, exist_ok=True)
+
+    # Generate filename
+    filename = generate_filename(title, note_type)
+    file_path = folder_path / filename
+
+    # Check if file already exists
+    if file_path.exists():
+        return {
+            "success": False,
+            "error": f"File already exists: {file_path.relative_to(VAULT_PATH)}",
+            "path": str(file_path.relative_to(VAULT_PATH)),
+        }
+
+    # Generate frontmatter and full content
+    frontmatter = generate_frontmatter(title, note_type, tags, related)
+    full_content = frontmatter + content
+
+    # Write the file
+    try:
+        file_path.write_text(full_content, encoding="utf-8")
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Failed to write file: {str(e)}",
+        }
+
+    # Invalidate cache to include the new note
+    vault_cache.refresh(force=True)
+
+    result = {
+        "success": True,
+        "path": str(file_path.relative_to(VAULT_PATH)),
+        "filename": filename,
+        "folder": target_folder,
+    }
+
+    if duplicates:
+        result["warnings"] = {
+            "potential_duplicates": duplicates,
+            "message": f"Found {len(duplicates)} potential duplicate(s). Review recommended.",
+        }
+
+    return result
+
+
 # ============== MCP Tools ==============
 
 @server.list_tools()
@@ -482,6 +942,72 @@ async def list_tools() -> list[Tool]:
                         "type": "integer",
                         "description": "Number of recent notes to return (default: 10)",
                         "default": 10
+                    }
+                }
+            }
+        ),
+        Tool(
+            name="knowledge_write",
+            description="Create a new note in the Knowledge vault with proper frontmatter and naming conventions. "
+                       "Naming conventions: C_ for concepts, YYYY-MM-DD_Conv_ for conversations, "
+                       "YYYY-MM-DD_Fix_ for troubleshooting notes. Checks for duplicates before creation.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Title of the note (will be used in filename and frontmatter)"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Body content of the note in Markdown format"
+                    },
+                    "type": {
+                        "type": "string",
+                        "description": "Type of note: concept, conversation, troubleshooting, session, reference, project",
+                        "enum": ["concept", "conversation", "troubleshooting", "session", "reference", "project"]
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of tags for the note (without # prefix)"
+                    },
+                    "folder": {
+                        "type": "string",
+                        "description": "Optional folder path. Defaults based on note type (e.g., 'Concepts' for concept)"
+                    },
+                    "related": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional list of related note titles for the 'related' frontmatter field"
+                    }
+                },
+                "required": ["title", "content", "type", "tags"]
+            }
+        ),
+        Tool(
+            name="knowledge_graph",
+            description="Generate a graph view of links between notes. Without center_note, returns the most connected clusters. "
+                       "With center_note, returns the subgraph around that note. Output is JSON with nodes[] and edges[] "
+                       "compatible with graph visualizations.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "center_note": {
+                        "type": "string",
+                        "description": "Optional. Title or path of the note to center the graph on. "
+                                      "If not provided, returns clusters of most connected notes."
+                    },
+                    "depth": {
+                        "type": "integer",
+                        "description": "Depth of connections to include when center_note is provided (default: 2)",
+                        "default": 2
+                    },
+                    "format": {
+                        "type": "string",
+                        "description": "Output format: 'json' for raw JSON, 'summary' for human-readable text (default: json)",
+                        "enum": ["json", "summary"],
+                        "default": "json"
                     }
                 }
             }
@@ -606,6 +1132,105 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             output += f"- **{note['title']}** ({note['path']})\n"
 
         return [TextContent(type="text", text=output)]
+
+    elif name == "knowledge_write":
+        title = arguments.get("title", "")
+        content = arguments.get("content", "")
+        note_type = arguments.get("type", "")
+        tags = arguments.get("tags", [])
+        folder = arguments.get("folder")
+        related = arguments.get("related")
+
+        if not title or not content or not note_type:
+            return [TextContent(type="text", text="Error: title, content, and type are required")]
+
+        if note_type not in NOTE_TYPE_CONFIG:
+            valid_types = ", ".join(NOTE_TYPE_CONFIG.keys())
+            return [TextContent(type="text", text=f"Error: Invalid type '{note_type}'. Valid types: {valid_types}")]
+
+        result = write_note(title, content, note_type, tags, folder, related)
+
+        if not result["success"]:
+            return [TextContent(type="text", text=f"Error: {result['error']}")]
+
+        output = f"# Note Created Successfully\n\n"
+        output += f"**Path:** {result['path']}\n"
+        output += f"**Filename:** {result['filename']}\n"
+        output += f"**Folder:** {result['folder']}\n"
+
+        if "warnings" in result:
+            output += f"\n## Warnings\n"
+            output += f"{result['warnings']['message']}\n\n"
+            for dup in result['warnings']['potential_duplicates']:
+                output += f"- **{dup['title']}** ({dup['path']}) - {dup['match_type']}\n"
+
+        return [TextContent(type="text", text=output)]
+
+    elif name == "knowledge_graph":
+        center_note = arguments.get("center_note")
+        depth = arguments.get("depth", 2)
+        output_format = arguments.get("format", "json")
+
+        if center_note:
+            # Return subgraph around a specific note
+            result = get_subgraph(center_note, depth)
+
+            if "error" in result:
+                return [TextContent(type="text", text=f"Error: {result['error']}")]
+
+            if output_format == "summary":
+                output = f"# Graph around '{result['center']}'\n\n"
+                output += f"**Depth:** {result['stats']['depth']}\n"
+                output += f"**Nodes:** {result['stats']['total_nodes']}\n"
+                output += f"**Edges:** {result['stats']['total_edges']}\n\n"
+
+                output += "## Nodes (by connections)\n"
+                sorted_nodes = sorted(result["nodes"], key=lambda x: x["connections"], reverse=True)
+                for node in sorted_nodes:
+                    center_marker = " [CENTER]" if node.get("is_center") else ""
+                    output += f"- **{node['title']}** ({node['connections']} connections){center_marker}\n"
+
+                output += "\n## Edges\n"
+                for edge in result["edges"][:50]:
+                    output += f"- {edge['source']} → {edge['target']}\n"
+
+                if len(result["edges"]) > 50:
+                    output += f"\n... and {len(result['edges']) - 50} more edges\n"
+
+                return [TextContent(type="text", text=output)]
+            else:
+                return [TextContent(type="text", text=json.dumps(result, indent=2))]
+        else:
+            # Return clusters of most connected notes
+            result = get_clusters()
+
+            if output_format == "summary":
+                output = "# Knowledge Graph Clusters\n\n"
+                output += f"**Total Nodes:** {result['stats']['total_nodes']}\n"
+                output += f"**Total Edges:** {result['stats']['total_edges']}\n"
+                output += f"**Orphan Notes:** {result['stats']['orphan_count']}\n\n"
+
+                output += "## Top Connected Hubs\n"
+                for cluster in result["clusters"]:
+                    hub = cluster["hub"]
+                    output += f"\n### {hub['title']} ({hub['connections']} connections)\n"
+                    output += f"Type: {hub['type']} | Path: {hub['path']}\n"
+                    if cluster["neighbors"]:
+                        output += f"Neighbors: {', '.join(cluster['neighbors'][:10])}"
+                        if len(cluster["neighbors"]) > 10:
+                            output += f" ... (+{len(cluster['neighbors']) - 10} more)"
+                        output += "\n"
+
+                if result["orphans"]:
+                    output += f"\n## Orphan Notes ({len(result['orphans'])})\n"
+                    for orphan in result["orphans"][:20]:
+                        output += f"- {orphan['title']} ({orphan['type']})\n"
+                    if len(result["orphans"]) > 20:
+                        output += f"\n... and {len(result['orphans']) - 20} more orphans\n"
+
+                return [TextContent(type="text", text=output)]
+            else:
+                return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
     return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
